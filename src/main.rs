@@ -1,6 +1,4 @@
 use std::env;
-use std::error::Error;
-use std::fmt::{Debug, Display};
 use std::fs;
 use std::process::ExitCode;
 
@@ -28,13 +26,13 @@ fn main() -> ExitCode {
                     println!("{output_file} successfully written!");
                 }
                 Err(err) => {
-                    eprintln!("encoding error: {err}");
+                    println!("encoding error: {err}");
                     return ExitCode::from(1);
                 }
             }
         }
         Err(err) => {
-            eprintln!("decoding error: {err}");
+            println!("decoding error: {err}");
             return ExitCode::from(1);
         }
     }

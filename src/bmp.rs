@@ -1,34 +1,17 @@
 use std::cmp::Ordering;
 use std::convert::TryInto;
-use std::fmt::{Debug, Display, Formatter};
+use std::fmt::{Debug};
 use std::num::NonZeroU32;
 use bytemuck::{cast_slice, from_bytes, from_bytes_mut, Pod, Zeroable};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use crate::common::{RGBA, RGBAImage};
+use anyhow::{anyhow, bail, Error};
 
 
-/*
-Errors
- */
 
-#[derive(Debug)]
-struct ParseError {
-    details: String
-}
 
-impl ParseError {
-    fn new(details: String) -> Box<ParseError> {
-        Box::new(ParseError {details})
-    }
-}
 
-impl std::error::Error for ParseError {}
 
-impl Display for ParseError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ParseError: {}", self.details)
-    }
-}
 
 
 /*
@@ -150,123 +133,72 @@ struct BitmapV5Header {
 
 
 /*
+Bit depths
+ */
+
+#[derive(Debug, IntoPrimitive, TryFromPrimitive, Copy, Clone, Eq, PartialEq)]
+#[repr(u16)]
+enum BitDepth {
+    One = 1,
+    Two = 2,
+    Four = 4,
+    Eight = 8,
+    Sixteen = 16,
+    TwentyFour = 24,
+    ThirtyTwo = 32
+}
+
+
+/*
 Compression types
  */
 
-#[derive(Debug, IntoPrimitive, TryFromPrimitive)]
+// constants documented in https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-wmf/4e588f70-bd92-4a6f-b77f-35d0feaf7a57
+#[derive(Debug, IntoPrimitive, TryFromPrimitive, Copy, Clone, Eq, PartialEq)]
 #[repr(u32)]
 enum Compression {
     RGB = 0x0,
     RLE8 = 0x1,
     RLE4 = 0x2,
-    Bitfields = 0x3,
-    JPEG = 0x4,
-    PNG = 0x5,
-    CMYK = 0xB,
-    CMYKRLE8 = 0xC,
-    CMYKRLE4 = 0xD
-}
+    Bitfields = 0x3
 
-// constants documented in https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-wmf/4e588f70-bd92-4a6f-b77f-35d0feaf7a57
-impl Compression {
-    fn new(val: u32) -> Result<Compression, Box<dyn std::error::Error>> {
-        use Compression::*;
-        let compression = Compression::try_from(val)?;
-        match compression {
-            RGB | RLE8 | RLE4 | Bitfields => {
-                Ok(compression)
-            }
-            _ => {
-                Err(ParseError::new(format!("Unsupported compression type ({compression:#?})")))
-            }
-        }
-    }
+    // The following compression types are documented but unsupported by this decoder as they are
+    // vanishingly rare, and quite frankly no other image processing suite seems to support these
+    // either.
+
+    // JPEG = 0x4,
+    // PNG = 0x5,
+    // CMYK = 0xB,
+    // CMYKRLE8 = 0xC,
+    // CMYKRLE4 = 0xD
 }
 
 
 /*
-Bit depths
+Each scanline encoding method must implement this trait.
  */
 
-struct DepthOne;
-struct DepthTwo;
-struct DepthFour;
-struct DepthEight;
-struct DepthSixteen;
-struct DepthTwentyFour;
-struct DepthThirtyTwo;
-
-trait Depth {
-    fn get(&self) -> u64;
+trait EncodingMethod {
     fn stride(&self, width: u64) -> u64;
-}
-
-pub enum BitDepth {
-    One(DepthOne),
-    Two(DepthTwo),
-    Four(DepthFour),
-    Eight(DepthEight),
-    Sixteen(DepthSixteen),
-    TwentyFour(DepthTwentyFour),
-    ThirtyTwo(DepthThirtyTwo)
-}
-
-impl BitDepth {
-    fn new(depth: u16) -> Result<BitDepth, Box<ParseError>> {
-        match depth {
-            1 => Ok(BitDepth::One(DepthOne {})),
-            2 => Ok(BitDepth::Two(DepthTwo {})),
-            4 => Ok(BitDepth::Four(DepthFour {})),
-            8 => Ok(BitDepth::Eight(DepthEight {})),
-            16 => Ok(BitDepth::Sixteen(DepthSixteen {})),
-            24 => Ok(BitDepth::TwentyFour(DepthTwentyFour {})),
-            32 => Ok(BitDepth::ThirtyTwo(DepthThirtyTwo {})),
-            _ => Err(ParseError::new(format!("Invalid bit depth of {depth}")))
-        }
-    }
-
-    fn get(&self) -> i32 {
-        match self {
-            BitDepth::One(_) => 1,
-            BitDepth::Two(_) => 2,
-            BitDepth::Four(_) => 4,
-            BitDepth::Eight(_) => 8,
-            BitDepth::Sixteen(_) => 16,
-            BitDepth::TwentyFour(_) => 24,
-            BitDepth::ThirtyTwo(_) => 32
-        }
-    }
-}
-
-impl Display for BitDepth {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.get())
-    }
+    fn decode_scanline(&self, index_bytes: &[u8], image_buffer: &mut [RGBA]);
 }
 
 
 /*
-Implementing paletted bit depths
+Bit depth of 1, RGB compression. Indexes a palette of max size 2 with a single bit.
  */
 
-trait Paletted: Depth {
-     fn write_paletted_bytes(&self, index_bytes: &[u8], image_buffer: &mut [RGBA], palette: &[RGBA]);
+struct Paletted1<'a> {
+    palette: &'a[RGBA]
 }
 
-// depth one (monochrome) implementations
-impl Depth for DepthOne {
-    fn get(&self) -> u64 {
-        1
-    }
-
+impl EncodingMethod for Paletted1<'_> {
     fn stride(&self, width: u64) -> u64 {
         let data_bytes = width.div_ceil(8);
         data_bytes.div_ceil(4)*4
     }
-}
 
-impl Paletted for DepthOne {
-    fn write_paletted_bytes(&self, index_bytes: &[u8], image_buffer: &mut [RGBA], palette: &[RGBA]) {
+    fn decode_scanline(&self, index_bytes: &[u8], image_buffer: &mut [RGBA]) {
         // suppose a 0x0 image is read, this ensures we exit normally (not writing anything into these 0-sized buffers
         // rather than panic
         if index_bytes.is_empty() {
@@ -286,29 +218,32 @@ impl Paletted for DepthOne {
 
             // colors are in order from msb to lsb, so we test msb for which color to write
             if curr_byte & 0x80 == 0 {
-                *color = palette[0];
+                *color = self.palette[0];
             }
             else {
-                *color = palette[1];
+                *color = self.palette[1];
             }
         }
     }
 }
 
-// depth two implementations
-impl Depth for DepthTwo {
-    fn get(&self) -> u64 {
-        2
-    }
 
+/*
+Bit depth of 2, RGB compression. Indexes a palette of max size 4 with two bits. Non-standard and
+generally highly unlikely to be supported.
+ */
+
+struct Paletted2<'a> {
+    palette: &'a[RGBA]
+}
+
+impl EncodingMethod for Paletted2<'_> {
     fn stride(&self, width: u64) -> u64 {
         let data_bytes = (width*2).div_ceil(8);
         data_bytes.div_ceil(4)*4
     }
-}
 
-impl Paletted for DepthTwo {
-    fn write_paletted_bytes(&self, index_bytes: &[u8], image_buffer: &mut [RGBA], palette: &[RGBA]) {
+    fn decode_scanline(&self, index_bytes: &[u8], image_buffer: &mut [RGBA]) {
         // suppose a 0x0 image is read, this ensures we exit normally (not writing anything into these 0-sized buffers
         // rather than panic
         if index_bytes.is_empty() {
@@ -319,32 +254,34 @@ impl Paletted for DepthTwo {
         for (i, color) in image_buffer.iter_mut().enumerate() {
             // from most significant to least significant in a byte,
             // offset should go 6, 4, 2, 0
-            let byte_offset = 8 - (i % 4) * 2;
+            let byte_offset = 6 - (i % 4) * 2;
             if byte_offset == 6 {
                 let byte_num = i / 4;
                 curr_byte = index_bytes[byte_num];
             }
 
             let index = (curr_byte >> byte_offset) & 0b11;
-            *color = palette[usize::from(index)];
+            *color = self.palette[usize::from(index)];
         }
     }
 }
 
-// depth four implementations
-impl Depth for DepthFour {
-    fn get(&self) -> u64 {
-        4
-    }
 
+/*
+Bit depth of 4, RGB compression. Indexes a palette of max size 16 with 4 bits.
+ */
+
+struct Paletted4<'a> {
+    palette: &'a[RGBA]
+}
+
+impl EncodingMethod for Paletted4<'_> {
     fn stride(&self, width: u64) -> u64 {
         let data_bytes = (width*4).div_ceil(8);
         data_bytes.div_ceil(4)*4
     }
-}
 
-impl Paletted for DepthFour {
-    fn write_paletted_bytes(&self, index_bytes: &[u8], image_buffer: &mut [RGBA], palette: &[RGBA]) {
+    fn decode_scanline(&self, index_bytes: &[u8], image_buffer: &mut [RGBA]) {
         // suppose a 0x0 image is read, this ensures we exit normally (not writing anything into these 0-sized buffers
         // rather than panic
         if index_bytes.is_empty() {
@@ -362,55 +299,46 @@ impl Paletted for DepthFour {
             }
 
             let index = if is_upper_half { curr_byte >> 4 } else { curr_byte & 0b1111 };
-            *color = palette[usize::from(index)];
-        }
-    }
-}
-
-// depth eight implementations
-impl Depth for DepthEight {
-    fn get(&self) -> u64 {
-        8
-    }
-
-    fn stride(&self, width: u64) -> u64 {
-        width.div_ceil(4)*4
-    }
-}
-
-impl Paletted for DepthEight {
-    fn write_paletted_bytes(&self, index_bytes: &[u8], image_buffer: &mut [RGBA], palette: &[RGBA]) {
-        for (i, color) in image_buffer.iter_mut().enumerate() {
-            *color = palette[usize::from(index_bytes[i])];
+            *color = self.palette[usize::from(index)];
         }
     }
 }
 
 
 /*
-Implementing unpaletted bit depths
+Bit depth of 8, RGB compression. Indexes a palette of max size 256 with 8 bits.
  */
 
-trait Unpaletted: Depth {
-    fn write_unpaletted_bytes(&self, index_bytes: &[u8], image_buffer: &mut [RGBA]);
+struct Paletted8<'a> {
+    palette: &'a[RGBA]
 }
 
-// depth sixteen implementations
-impl Depth for DepthSixteen {
-    fn get(&self) -> u64 {
-        16
+impl EncodingMethod for Paletted8<'_> {
+    fn stride(&self, width: u64) -> u64 {
+        width.div_ceil(4)*4
     }
 
+    fn decode_scanline(&self, index_bytes: &[u8], image_buffer: &mut [RGBA]) {
+        for (i, color) in image_buffer.iter_mut().enumerate() {
+            *color = self.palette[usize::from(index_bytes[i])];
+        }
+    }
+}
+
+
+/*
+Bit depth of 16, RGB compression. Stores 5 bits for each color channel, with the MSB unused. (no alpha)
+ */
+
+struct Uncompressed16 {}
+
+impl EncodingMethod for Uncompressed16 {
     fn stride(&self, width: u64) -> u64 {
         let data_bytes = width*2;
         data_bytes.div_ceil(4)*4
     }
-}
 
-
-impl Unpaletted for DepthSixteen {
-    #[allow(clippy::cast_possible_truncation)]
-    fn write_unpaletted_bytes(&self, index_bytes: &[u8], image_buffer: &mut [RGBA]) {
+    fn decode_scanline(&self, index_bytes: &[u8], image_buffer: &mut [RGBA]) {
         const RED_MASK: u16 = 0b11111_00000_00000;
         const GREEN_MASK: u16 = 0b00000_11111_00000;
         const BLUE_MASK: u16 = 0b00000_00000_11111;
@@ -429,20 +357,20 @@ impl Unpaletted for DepthSixteen {
     }
 }
 
-// depth twenty-four implementations
-impl Depth for DepthTwentyFour {
-    fn get(&self) -> u64 {
-        24
-    }
 
+/*
+Bit depth of 24, RGB compression. Stores a full byte per color channel, with no alpha.
+ */
+
+struct Uncompressed24 {}
+
+impl EncodingMethod for Uncompressed24 {
     fn stride(&self, width: u64) -> u64 {
         let data_bytes = width*3;
         data_bytes.div_ceil(4)*4
     }
-}
 
-impl Unpaletted for DepthTwentyFour {
-    fn write_unpaletted_bytes(&self, index_bytes: &[u8], image_buffer: &mut [RGBA]) {
+    fn decode_scanline(&self, index_bytes: &[u8], image_buffer: &mut [RGBA]) {
         let mut index_offset = 0;
         for color in image_buffer {
             color.b = index_bytes[index_offset];
@@ -453,25 +381,26 @@ impl Unpaletted for DepthTwentyFour {
     }
 }
 
-// depth thirty-two implementations
-impl Depth for DepthThirtyTwo {
-    fn get(&self) -> u64 {
-        32
-    }
 
+/*
+Bit depth of 32, RGB compression. Stores a full byte per color channel, with no alpha, leaving a
+full byte unused in each set of 4.
+ */
+
+struct Uncompressed32 {}
+
+impl EncodingMethod for Uncompressed32 {
     fn stride(&self, width: u64) -> u64 {
         width*4
     }
-}
 
-impl Unpaletted for DepthThirtyTwo {
-    fn write_unpaletted_bytes(&self, index_bytes: &[u8], image_buffer: &mut [RGBA]) {
+    fn decode_scanline(&self, index_bytes: &[u8], image_buffer: &mut [RGBA]) {
         let mut index_offset = 0;
         for color in image_buffer {
-            // high byte unused
             color.b = index_bytes[index_offset];
             color.g = index_bytes[index_offset+1];
             color.r = index_bytes[index_offset+2];
+            // high byte unused
             index_offset += 4;
         }
     }
@@ -479,12 +408,160 @@ impl Unpaletted for DepthThirtyTwo {
 
 
 /*
-Implementing bitfield-using bitdepths
+Bit depth of 16, bitfield compression. Uses header-specified bit masks to decide which bits and how
+many bits to assigned to each color channel.
  */
 
-trait BitField {
-    fn write_bitfield_bytes(&self, index_bytes: &[u8], image_buffer: &mut [RGBA]);
+struct Bitfield16 {
+    red_mask: u16,
+    green_mask: u16,
+    blue_mask: u16
 }
+
+// We require a constructor for Bitfield16 to check that the input mask fields are contiguous
+// and don't overlap (required by https://learn.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-bitmapv5header).
+impl Bitfield16 {
+    fn new(r: u32, g: u32, b: u32) -> Result<Bitfield16, Error> {
+        let Ok(red_mask) = u16::try_from(r) else { bail!("Red bitmask too large for bitfield compression of bitdepth 16") };
+        let Ok(green_mask) = u16::try_from(g) else { bail!("Green bitmask too large for bitfield compression of bitdepth 16") };
+        let Ok(blue_mask) = u16::try_from(b) else { bail!("Blue bitmask too large for bitfield compression of bitdepth 16") };
+
+        if red_mask.count_ones() != 16 - red_mask.leading_zeros() - red_mask.trailing_zeros() {
+            bail!("Red bitmask is not contiguous (mask is {red_mask:#018b})")
+        }
+        else if green_mask.count_ones() != 16 - green_mask.leading_zeros() - green_mask.trailing_zeros() {
+            bail!("Green bitmask is not contiguous (mask is {green_mask:#018b})")
+        }
+        else if blue_mask.count_ones() != 16 - blue_mask.leading_zeros() - blue_mask.trailing_zeros() {
+            bail!("Blue bitmask is not contiguous (mask is {blue_mask:#018b})")
+        }
+        else if (red_mask | blue_mask | green_mask).count_ones() != red_mask.count_ones() + green_mask.count_ones() + blue_mask.count_ones() {
+            bail!("Overlapping bitmasks:\n\tRed is   {red_mask:#018b}\n\tGreen is {green_mask:#018b}\n\tBlue is  {blue_mask:#018b}")
+        }
+
+        println!("Bitfield compression masks:\n\tRed is   {red_mask:#018b}\n\tGreen is {green_mask:#018b}\n\tBlue is  {blue_mask:#018b}");
+        Ok(Bitfield16 { red_mask, green_mask, blue_mask })
+    }
+
+    // For color channels with precision greater than 8, we truncate down to 8. Otherwise, we
+    // shift upwards to occupy the most significant bits and repeat the value till all bits are
+    // filled. For instance, 0b110 will be converted to 0b11011011.
+    fn channel_to_color(channel: u16, mask: u16) -> u8 {
+        let mut val = channel & mask;
+        val >>= mask.trailing_zeros();
+        if mask.count_ones() >= 8 {
+            val >>= mask.count_ones() - 8;
+        }
+        else {
+            let mut gaps_left: i32 = 8 - i32::try_from(mask.count_ones()).unwrap();
+            val <<= 8 - mask.count_ones();
+            let mut base = val;
+            while gaps_left > 0 {
+                base >>= mask.count_ones();
+                val |= base;
+                gaps_left -= i32::try_from(mask.count_ones()).unwrap();
+            }
+        }
+
+        val as u8
+    }
+}
+
+impl EncodingMethod for Bitfield16 {
+    fn stride(&self, width: u64) -> u64 {
+        (Uncompressed16 {}).stride(width) // stride is the same as uncompressed 16
+    }
+
+    fn decode_scanline(&self, index_bytes: &[u8], image_buffer: &mut [RGBA]) {
+        let word_index_bytes: &[u16] = cast_slice(index_bytes);
+        for (i, color) in image_buffer.iter_mut().enumerate() {
+            let curr_word = word_index_bytes[i];
+            color.r = Bitfield16::channel_to_color(curr_word, self.red_mask);
+            color.g = Bitfield16::channel_to_color(curr_word, self.green_mask);
+            color.b = Bitfield16::channel_to_color(curr_word, self.blue_mask);
+        }
+    }
+}
+
+
+/*
+Bit depth of 32, bitfield compression. Uses header-specified bit masks to decide which bits and how
+many bits to assigned to each color channel.
+ */
+
+
+struct Bitfield32 {
+    red_mask: u32,
+    green_mask: u32,
+    blue_mask: u32
+}
+
+// We require a constructor for Bitfield16 to check that the input mask fields are contiguous
+// and don't overlap (required by https://learn.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-bitmapv5header).
+impl Bitfield32 {
+    fn new(red_mask: u32, green_mask: u32, blue_mask: u32) -> Result<Bitfield32, Error> {
+        if red_mask.count_ones() != 32 - red_mask.leading_zeros() - red_mask.trailing_zeros() {
+            bail!("Red bitmask is not contiguous (mask is {red_mask:#034b})")
+        }
+        else if green_mask.count_ones() != 32 - green_mask.leading_zeros() - green_mask.trailing_zeros() {
+            bail!("Green bitmask is not contiguous (mask is {green_mask:#034b})")
+        }
+        else if blue_mask.count_ones() != 32 - blue_mask.leading_zeros() - blue_mask.trailing_zeros() {
+            bail!("Blue bitmask is not contiguous (mask is {blue_mask:#034b})")
+        }
+        else if (red_mask | blue_mask | green_mask).count_ones() != red_mask.count_ones() + green_mask.count_ones() + blue_mask.count_ones() {
+            bail!("Overlapping bitmasks:\n\tRed is   {red_mask:#034b}\n\tGreen is {green_mask:#034b}\n\tBlue is  {blue_mask:#034b}")
+        }
+
+        println!("Bitfield compression masks:\n\tRed is   {red_mask:#034b}\n\tGreen is {green_mask:#034b}\n\tBlue is  {blue_mask:#034b}");
+        Ok(Bitfield32 { red_mask, green_mask, blue_mask })
+    }
+
+    // For color channels with precision greater than 8, we truncate down to 8. Otherwise, we
+    // shift upwards to occupy the most significant bits and repeat the value till all bits are
+    // filled. For instance, 0b110 will be converted to 0b11011011.
+    // This is identical to the methods
+    fn channel_to_color(channel: u32, mask: u32) -> u8 {
+        let mut val = channel & mask;
+        val >>= mask.trailing_zeros();
+        if mask.count_ones() >= 8 {
+            val >>= mask.count_ones() - 8;
+        }
+        else {
+            let mut gaps_left: i32 = 8 - i32::try_from(mask.count_ones()).unwrap();
+            val <<= 8 - mask.count_ones();
+            let mut base = val;
+            while gaps_left > 0 {
+                base >>= mask.count_ones();
+                val |= base;
+                gaps_left -= i32::try_from(mask.count_ones()).unwrap();
+            }
+        }
+ 
+        val as u8
+    }
+}
+
+impl EncodingMethod for Bitfield32 {
+    fn stride(&self, width: u64) -> u64 {
+        (Uncompressed32 {}).stride(width) // stride is the same as uncompressed 16
+    }
+
+    fn decode_scanline(&self, index_bytes: &[u8], image_buffer: &mut [RGBA]) {
+        // we need to create a copy here to re-align the index bytes to increments of 4 bytes
+        let mut index_bytes_copy = vec![0; index_bytes.len()];
+        index_bytes_copy.clone_from_slice(index_bytes);
+
+        let word_index_bytes: &[u32] = cast_slice(index_bytes_copy.as_slice());
+        for (i, color) in image_buffer.iter_mut().enumerate() {
+            let curr_word = word_index_bytes[i];
+            color.r = Bitfield32::channel_to_color(curr_word, self.red_mask);
+            color.g = Bitfield32::channel_to_color(curr_word, self.green_mask);
+            color.b = Bitfield32::channel_to_color(curr_word, self.blue_mask);
+        }
+    }
+}
+
 
 /*
 Palette parsing
@@ -513,10 +590,10 @@ struct BGRTriple {
     r: u8
 }
 
-fn create_palette<'a, D: Paletted>(buf: &'a[u8], bit_depth: &D, palette_size: NonZeroU32, palette_format: PaletteFormat) -> Result<(Vec<RGBA>, &'a[u8]), Box<dyn std::error::Error>> {
+fn create_palette(buf: &[u8], bit_depth: u16, palette_size: NonZeroU32, palette_format: &PaletteFormat) -> Result<Vec<RGBA>, Error> {
     // rgba_palette is extended to include all possible index values for the given bit depth (2^bit_depth)
     // ensuring that invalid indexes result in a black pixel by default rather than a panic
-    let max_palette_size: usize = 1 << bit_depth.get();
+    let max_palette_size: usize = 1 << bit_depth;
     let mut rgba_palette: Vec<RGBA> = Vec::new();
     rgba_palette.reserve_exact(max_palette_size);
     let index_bytes;
@@ -542,7 +619,7 @@ fn create_palette<'a, D: Paletted>(buf: &'a[u8], bit_depth: &D, palette_size: No
         }
     }
 
-    Ok((rgba_palette, index_bytes))
+    Ok(rgba_palette)
 }
 
 
@@ -556,8 +633,8 @@ enum ScanlineOrder {
 }
 
 
-fn write_paletted_image<D: Paletted> (buf: &[u8], rgba_palette: &[RGBA], depth: &D, order: ScanlineOrder, width: u64, height: u64) -> Result<RGBAImage, Box<dyn std::error::Error>> {
-    let stride: usize = depth.stride(width).try_into()?;
+fn write_image<E: EncodingMethod> (buf: &[u8], encoding_method: &E, order: ScanlineOrder, width: u64, height: u64) -> Result<RGBAImage, Error> {
+    let stride: usize = encoding_method.stride(width).try_into()?;
     let mut remaining_bitmap_data = buf;
 
     let mut image_data: Vec<RGBA> = Vec::new();
@@ -575,7 +652,7 @@ fn write_paletted_image<D: Paletted> (buf: &[u8], rgba_palette: &[RGBA], depth: 
                 (curr_bitmap_scanline, remaining_bitmap_data) = remaining_bitmap_data.split_at(stride);
                 let curr_image_buf;
                 (curr_image_buf, remaining_image_data) = remaining_image_data.split_at_mut(width_split);
-                depth.write_paletted_bytes(curr_bitmap_scanline, curr_image_buf, &rgba_palette);
+                encoding_method.decode_scanline(curr_bitmap_scanline, curr_image_buf);
             }
         }
         ScanlineOrder::BottomUp => {
@@ -584,44 +661,7 @@ fn write_paletted_image<D: Paletted> (buf: &[u8], rgba_palette: &[RGBA], depth: 
                 (curr_bitmap_scanline, remaining_bitmap_data) = remaining_bitmap_data.split_at(stride);
                 let curr_image_buf;
                 (remaining_image_data, curr_image_buf) = remaining_image_data.split_at_mut(remaining_image_data.len()-width_split);
-                depth.write_paletted_bytes(curr_bitmap_scanline, curr_image_buf, &rgba_palette);
-            }
-        }
-    }
-
-    Ok(RGBAImage { width, height, data: image_data.into_boxed_slice() })
-}
-
-
-fn write_unpaletted_image<D: Unpaletted>(buf: &[u8], depth: &D, order: ScanlineOrder, width: u64, height: u64) -> Result<RGBAImage, Box<dyn std::error::Error>> {
-    let stride: usize = depth.stride(width).try_into()?;
-
-    let mut image_data: Vec<RGBA> = Vec::new();
-    let image_data_size: usize = (width*height).try_into()?;
-    image_data.reserve_exact(image_data_size);
-    image_data.resize(image_data_size, RGBA { r: 0, g: 0, b: 0, a: 0 });
-    let mut remaining_image_data: &mut [RGBA] = &mut image_data;
-
-    let width_split: usize = width.try_into()?;
-    let mut remaining_bitmap_data = buf;
-
-    match order {
-        ScanlineOrder::TopDown => {
-            for _ in 0..height {
-                let curr_bitmap_scanline;
-                (curr_bitmap_scanline, remaining_bitmap_data) = remaining_bitmap_data.split_at(stride);
-                let curr_image_buf;
-                (curr_image_buf, remaining_image_data) = remaining_image_data.split_at_mut(width_split);
-                depth.write_unpaletted_bytes(curr_bitmap_scanline, curr_image_buf);
-            }
-        }
-        ScanlineOrder::BottomUp => {
-            for _ in 0..height {
-                let curr_bitmap_scanline;
-                (curr_bitmap_scanline, remaining_bitmap_data) = remaining_bitmap_data.split_at(stride);
-                let curr_image_buf;
-                (remaining_image_data, curr_image_buf) = remaining_image_data.split_at_mut(remaining_image_data.len()-width_split);
-                depth.write_unpaletted_bytes(curr_bitmap_scanline, curr_image_buf);
+                encoding_method.decode_scanline(curr_bitmap_scanline, curr_image_buf);
             }
         }
     }
@@ -633,70 +673,101 @@ fn write_unpaletted_image<D: Unpaletted>(buf: &[u8], depth: &D, order: ScanlineO
 /*
 Main decode entry point
  */
-pub fn decode(rest: &[u8]) -> Result<RGBAImage, Box<dyn std::error::Error>> {
-
+pub fn decode(rest: &[u8]) -> Result<RGBAImage, Error> {
     // parse header, verify magic number is correct
     let (file_header_bytes, rest) = rest.split_at(BITMAP_FILE_HEADER_SIZE.try_into()?);
     let file_header: &BitmapFileHeader = from_bytes(file_header_bytes);
     if file_header.magic_number != BITMAP_MAGIC_NUMBER {
-        return Err(ParseError::new(format!("Incorrect magic number of {:?}", file_header.magic_number)));
+        bail!("Incorrect magic number of {:?}", file_header.magic_number)
     }
+    let index_bytes = &rest[usize::try_from(file_header.bitmap_offset-BITMAP_FILE_HEADER_SIZE)?..];
 
 
     // info header fields must be read differently depending on the version of the info header
-    // version is deduced by the headers' size (stored as the first 4 bytes as DWORD)
+    // version is deduced by the headers' size (stored as the first 4 bytes as DWORD) //(i32, i32, BitDepth, Compression, &[u8], PaletteFormat)
     let info_header_size = u32::from_le_bytes(rest[0..4].try_into()?);
-    let t: u32 = file_header.bitmap_offset;
     let palette_size = NonZeroU32::new(file_header.bitmap_offset-info_header_size-BITMAP_FILE_HEADER_SIZE);
-    let (width, height_temp, bit_depth, compression, rest, palette_format): (i32, i32, BitDepth, Compression, &[u8], PaletteFormat) = match info_header_size {
+    let (width, height_temp, bit_depth, compression, rest, palette_format, bitmask_red, bitmask_green, bitmask_blue) = match info_header_size {
 
         // header is BITMAPCOREHEADER
         BITMAP_CORE_HEADER_SIZE => {
             let (header_bytes, rest) = rest.split_at(BITMAP_CORE_HEADER_SIZE.try_into()?);
             let h: &BitmapCoreHeader = from_bytes(header_bytes);
 
-            Ok((h.width.into(), h.height.into(), BitDepth::new(h.bit_depth)?, Compression::RGB, rest, PaletteFormat::BGRTriple))
+            // It is ok for us to return junk data as bitmask values because there is no bitfield compression
+            // for this header type anyways. Furthermore, passing all ones would trigger an obvious
+            // error in the constructor for bitfield encoding types.
+            Ok((h.width.into(), h.height.into(), BitDepth::try_from(h.bit_depth)?, Compression::RGB, rest, PaletteFormat::BGRTriple, 0xFFFFu32, 0xFFFFu32, 0xFFFFu32))
         },
 
         // header is BITMAPINFOHEADER (the vast majority of images are of this type)
         BITMAP_INFO_HEADER_SIZE => {
-            let (header_bytes, rest) = rest.split_at(BITMAP_INFO_HEADER_SIZE.try_into()?);
+            let header_bytes;
+            let mut new_rest: &[u8];
+            (header_bytes, new_rest) = rest.split_at(BITMAP_INFO_HEADER_SIZE.try_into()?);
             let h: &BitmapInfoHeader = from_bytes(header_bytes);
 
-            Ok((h.width, h.height, BitDepth::new(h.bit_depth)?, Compression::new(h.compression)?, rest, PaletteFormat::BGRQuad))
+            // For this header type only, if bitfield compression is specified, the bit masks are instead
+            // stored in 3 DWORDs in the palette field (after the header and before the bitmap)
+            let compression = Compression::try_from(h.compression)?;
+            let red_mask;
+            let green_mask;
+            let blue_mask;
+            if compression == Compression::Bitfields {
+                let mut mask_bytes;
+                (mask_bytes, new_rest) = new_rest.split_at(4);
+                red_mask = u32::from_le_bytes(mask_bytes.try_into()?);
+                (mask_bytes, new_rest) = new_rest.split_at(4);
+                green_mask = u32::from_le_bytes(mask_bytes.try_into()?);
+                (mask_bytes, new_rest) = new_rest.split_at(4);
+                blue_mask = u32::from_le_bytes(mask_bytes.try_into()?);
+            }
+            else {
+                red_mask = 0xFFFF;
+                green_mask = 0xFFFF;
+                blue_mask = 0xFFFF;
+            }
+
+            Ok((h.width, h.height, BitDepth::try_from(h.bit_depth)?, compression, new_rest, PaletteFormat::BGRQuad, red_mask, green_mask, blue_mask))
         },
 
         BITMAP_V4_HEADER_SIZE => {
             let (header_bytes, rest) = rest.split_at(BITMAP_V4_HEADER_SIZE.try_into()?);
             let h: &BitmapV4Header = from_bytes(header_bytes);
 
-            Ok((h.width, h.height, BitDepth::new(h.bit_depth)?, Compression::new(h.compression)?, rest, PaletteFormat::BGRQuad))
+            Ok((h.width, h.height, BitDepth::try_from(h.bit_depth)?, Compression::try_from(h.compression)?, rest, PaletteFormat::BGRQuad, h.red_mask, h.green_mask, h.blue_mask))
         },
 
         BITMAP_V5_HEADER_SIZE => {
             let (header_bytes, rest) = rest.split_at(BITMAP_V5_HEADER_SIZE.try_into()?);
             let h: &BitmapV5Header = from_bytes(header_bytes);
 
-            Ok((h.width, h.height, BitDepth::new(h.bit_depth)?, Compression::new(h.compression)?, rest, PaletteFormat::BGRQuad))
+            Ok((h.width, h.height, BitDepth::try_from(h.bit_depth)?, Compression::try_from(h.compression)?, rest, PaletteFormat::BGRQuad, h.red_mask, h.green_mask, h.blue_mask))
         },
 
         _ => {
-            Err(ParseError::new(format!("Unrecognized bitmap info header (size was {info_header_size})")))
+            Err(anyhow!("Unrecognized bitmap info header (size was {info_header_size})"))
         }
     }?;
 
     // double check that palette size makes sense for the given bit depth
-    println!("Bit depth: {}", bit_depth);
+    println!("Bit depth: {}", u16::from(bit_depth));
     let rest = match bit_depth {
-        BitDepth::One(_) | BitDepth::Two(_) | BitDepth::Four(_) | BitDepth::Eight(_) => {
+        BitDepth::One | BitDepth::Two | BitDepth::Four | BitDepth::Eight => {
             if palette_size.is_none() {
-                return Err(ParseError::new(format!("Paletted bit depth ({bit_depth}) is missing a palette")));
+                bail!("Paletted bit depth ({}) is missing a palette", u16::from(bit_depth))
             }
             rest
-        }
+        },
+        // This arm guards against a palette warning showing up for bitfield compression types, as
+        // some headers use the palette area to store the bitmasks. This arm simply suppresses the
+        // warning and correction that would otherwise be incorrectly applied in these circumstances.
+        BitDepth::Sixteen | BitDepth::ThirtyTwo if compression == Compression::Bitfields => {
+            rest
+        },
         _ => {
             if let Some(nz_size) = palette_size {
-                println!("WARNING: Bit depth of {bit_depth} has non-zero palette size of {nz_size}");
+                println!("WARNING: Bit depth of {} has non-zero palette size of {}", u16::from(bit_depth), nz_size);
                 let (_, rest) = rest.split_at(nz_size.get().try_into()?); // ensure that palette is skipped for non-paletted images with extraneous palettes
                 rest
             }
@@ -709,7 +780,7 @@ pub fn decode(rest: &[u8]) -> Result<RGBAImage, Box<dyn std::error::Error>> {
     // width should be non-zero
     match width.cmp(&0) {
         Ordering::Less => {
-            return Err(ParseError::new(format!("Width is a negative number ({width})")));
+            bail!("Width is a negative number ({width})")
         }
         Ordering::Equal => {
             println!("WARNING: Width is zero");
@@ -725,45 +796,80 @@ pub fn decode(rest: &[u8]) -> Result<RGBAImage, Box<dyn std::error::Error>> {
         println!("WARNING: Height is zero");
     }
 
-    // sort into generic paletted or unpaletted functions to write the actual output
+    // sort into differing scanline decode methods based on bit depth and compression type
     match bit_depth {
-        BitDepth::One(d) => {
-            let (rgba_palette, rest) = create_palette(rest, &d, palette_size.unwrap(), palette_format)?;
-            write_paletted_image(rest, &rgba_palette, &d, scanline_order, width_converted, height)
-        },
-        BitDepth::Two(d) => {
-            let (rgba_palette, rest) = create_palette(rest, &d, palette_size.unwrap(), palette_format)?;
-            write_paletted_image(rest, &rgba_palette, &d, scanline_order, width_converted, height)
-        },
-        BitDepth::Four(d) => {
-            let (rgba_palette, rest) = create_palette(rest, &d, palette_size.unwrap(), palette_format)?;
-            write_paletted_image(rest, &rgba_palette, &d, scanline_order, width_converted, height)
-        },
-        BitDepth::Eight(d) => {
-            let (rgba_palette, rest) = create_palette(rest, &d, palette_size.unwrap(), palette_format)?;
-            write_paletted_image(rest, &rgba_palette, &d, scanline_order, width_converted, height)
-        },
-        BitDepth::Sixteen(d) => {
-            write_unpaletted_image(rest, &d, scanline_order, width_converted, height)
+        BitDepth::One => {
+            if compression != Compression::RGB {
+                bail!("Bit depth of 1 only supports RGB compression (used {compression:#?})")
+            }
+            let rgba_palette = create_palette(rest, bit_depth.into(), palette_size.unwrap(), &palette_format)?;
+            let decode_method = Paletted1 { palette: &rgba_palette };
+            write_image(index_bytes, &decode_method, scanline_order, width_converted, height)
         }
-        BitDepth::TwentyFour(d) => {
-            write_unpaletted_image(rest, &d, scanline_order, width_converted, height)
+        BitDepth::Two => {
+            if compression != Compression::RGB {
+                bail!("Bit depth of 2 only supports RGB compression (used {compression:#?})")
+            }
+            let rgba_palette = create_palette(rest, bit_depth.into(), palette_size.unwrap(), &palette_format)?;
+            let decode_method = Paletted2 { palette: &rgba_palette };
+            write_image(index_bytes, &decode_method, scanline_order, width_converted, height)
         }
-        BitDepth::ThirtyTwo(d) => {
+        BitDepth::Four => {
+            if compression != Compression::RGB {
+                bail!("Bit depth of 4 only supports RGB compression (used {compression:#?})")
+            }
+            let rgba_palette = create_palette(rest, bit_depth.into(), palette_size.unwrap(), &palette_format)?;
+            let decode_method = Paletted4 { palette: &rgba_palette };
+            write_image(index_bytes, &decode_method, scanline_order, width_converted, height)
+        }
+        BitDepth::Eight => {
+            if compression != Compression::RGB {
+                bail!("Bit depth of 8 only supports RGB compression (used {compression:#?})")
+            }
+            let rgba_palette = create_palette(rest, bit_depth.into(), palette_size.unwrap(), &palette_format)?;
+            let decode_method = Paletted8 { palette: &rgba_palette };
+            write_image(index_bytes, &decode_method, scanline_order, width_converted, height)
+        }
+        BitDepth::Sixteen => {
             match compression {
                 Compression::RGB => {
-                    write_unpaletted_image(rest, &d, scanline_order, width_converted, height)
-                },
-                _ => Err(ParseError::new(format!("Bit depth of 32 has invalid compression type of {compression:#?}")))
+                    let encoding_method = Uncompressed16 {};
+                    write_image(index_bytes, &encoding_method, scanline_order, width_converted, height)
+                }
+                Compression::Bitfields => {
+                    let encoding_method = Bitfield16::new(bitmask_red, bitmask_green, bitmask_blue)?;
+                    write_image(index_bytes, &encoding_method, scanline_order, width_converted, height)
+                }
+                _ => bail!("Bit depth of 16 only supports RGB compression or bitfield compression (used {compression:#?})")
             }
         }
-    }
+        BitDepth::TwentyFour => {
+            if compression != Compression::RGB {
+                bail!("Bit depth of 24 only supports RGB compression (used {compression:#?})")
+            }
+            let decode_method = Uncompressed24 {};
+            write_image(index_bytes, &decode_method, scanline_order, width_converted, height)
+        }
+        BitDepth::ThirtyTwo => {
+            match compression {
+                Compression::RGB => {
+                    let encoding_method = Uncompressed32 {};
+                    write_image(index_bytes, &encoding_method, scanline_order, width_converted, height)
+                }
+                Compression::Bitfields => {
+                    let encoding_method = Bitfield32::new(bitmask_red, bitmask_green, bitmask_blue)?;
+                    write_image(index_bytes, &encoding_method, scanline_order, width_converted, height)
+                }
+                _ => bail!("Bit depth of 32 only supports RGB compression or bitfield compression (used {compression:#?})")
+            }
+        }
+    } 
 }
 
 
 pub fn encode(image: &RGBAImage) -> Result<Box<[u8]>, Box<dyn std::error::Error>> {
     // calculate scanline width in bytes
-    let scanline_width: usize = DepthTwentyFour.stride(image.width).try_into()?;
+    let scanline_width: usize = (Uncompressed24 {}).stride(image.width).try_into()?;
 
     // buffer size should be file header + info header + 3 bytes per pixel color - no palette needed
     let buffer_size: usize = (u64::from(BITMAP_FILE_HEADER_SIZE) + u64::from(BITMAP_INFO_HEADER_SIZE) + u64::try_from(scanline_width)?*image.height).try_into()?;

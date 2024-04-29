@@ -68,8 +68,8 @@ for dirpath, dirnames, filenames in os.walk(SAMPLE_DIR):
 
         try:
             if PRECONVERT_WITH_FFMPEG:
-                subprocess.run(f'ffmpeg -hide_banner -loglevel warning -i "{converted_path}" -update true -pix_fmt rgb24 {os.path.join(SCRATCH_DIR, "conv.png")}')
-                subprocess.run(f'ffmpeg -hide_banner -loglevel warning -i "{reference_path}" -update true -pix_fmt rgb24 {os.path.join(SCRATCH_DIR, "ref.png")}')
+                subprocess.run(f'ffmpeg -hide_banner -loglevel warning -y -i "{converted_path}" -update true -pix_fmt rgb24 {os.path.join(SCRATCH_DIR, "conv.png")}')
+                subprocess.run(f'ffmpeg -hide_banner -loglevel warning -y -i "{reference_path}" -update true -pix_fmt rgb24 {os.path.join(SCRATCH_DIR, "ref.png")}')
                 converted_img = Image.open(os.path.join(SCRATCH_DIR, 'conv.png'))
                 reference_img = Image.open(os.path.join(SCRATCH_DIR, 'ref.png'))
             else:

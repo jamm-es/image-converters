@@ -8,12 +8,6 @@ use crate::common::{RGBA, RGBAImage};
 use anyhow::{anyhow, bail, Error};
 
 
-
-
-
-
-
-
 /*
 File headers
  */
@@ -596,13 +590,12 @@ fn create_palette(buf: &[u8], bit_depth: u16, palette_size: NonZeroU32, palette_
     let max_palette_size: usize = 1 << bit_depth;
     let mut rgba_palette: Vec<RGBA> = Vec::new();
     rgba_palette.reserve_exact(max_palette_size);
-    let index_bytes;
 
     match palette_format {
         PaletteFormat::BGRQuad => {
             println!("Creating palette from quads...");
             let palette_bytes;
-            (palette_bytes, index_bytes) = buf.split_at(palette_size.get().try_into()?);
+            (palette_bytes, _) = buf.split_at(palette_size.get().try_into()?);
             let palette: &[BGRQuad] = cast_slice(palette_bytes);
             println!("Calculated palette size of {} ({} colors)", palette_size, palette_size.get()/4);
             rgba_palette.extend(palette.iter().map(|bgr| RGBA { r: bgr.r, g: bgr.g, b: bgr.b, a: 0xFF }));
@@ -611,7 +604,7 @@ fn create_palette(buf: &[u8], bit_depth: u16, palette_size: NonZeroU32, palette_
         PaletteFormat::BGRTriple => {
             println!("Creating palette from triples...");
             let palette_bytes;
-            (palette_bytes, index_bytes) = buf.split_at(palette_size.get().try_into()?);
+            (palette_bytes, _) = buf.split_at(palette_size.get().try_into()?);
             let palette: &[BGRTriple] = cast_slice(palette_bytes);
             println!("Calculated palette size of {} ({} colors)", palette_size, palette_size.get()/3);
             rgba_palette.extend(palette.iter().map(|bgr| RGBA { r: bgr.r, g: bgr.g, b: bgr.b, a: 0xFF }));
@@ -627,6 +620,7 @@ fn create_palette(buf: &[u8], bit_depth: u16, palette_size: NonZeroU32, palette_
 Constructing output image from color index, genericized to minimize matching within hot loop
  */
 
+#[derive(Eq, PartialEq, Copy, Clone)]
 enum ScanlineOrder {
     TopDown,
     BottomUp
@@ -662,6 +656,206 @@ fn write_image<E: EncodingMethod> (buf: &[u8], encoding_method: &E, order: Scanl
                 let curr_image_buf;
                 (remaining_image_data, curr_image_buf) = remaining_image_data.split_at_mut(remaining_image_data.len()-width_split);
                 encoding_method.decode_scanline(curr_bitmap_scanline, curr_image_buf);
+            }
+        }
+    }
+
+    Ok(RGBAImage { width, height, data: image_data.into_boxed_slice() })
+}
+
+
+/*
+Write image using run length encoding (RLE) compression
+ */
+
+fn advance_row_col(row: usize, col: usize, width: usize, height: usize, order: ScanlineOrder) -> (usize, usize) {
+    let mut new_row = row;
+    let mut new_col = col;
+    if new_col == width-1 {
+        new_col = 0;
+        if order == ScanlineOrder::TopDown {
+            if new_row == height-1 {
+                println!("Coordinate out of bounds - expecting end of bitmap");
+            }
+            else {
+                new_row += 1;
+            }
+        } else {
+            if new_row == 0 {
+                println!("Coordinate out of bounds - expecting end of bitmap");
+            }
+            else {
+                new_row -= 1;
+            }
+        }
+    }
+    else {
+        new_col += 1;
+    }
+
+    (new_row, new_col)
+}
+
+fn write_image_rle8(buf: &[u8], order: ScanlineOrder, palette: &[RGBA], width: u64, height: u64) -> Result<RGBAImage, Error> {
+    let mut image_data: Vec<RGBA> = Vec::new();
+    let image_data_size: usize = (width*height).try_into()?;
+    image_data.reserve_exact(image_data_size);
+    image_data.resize(image_data_size, RGBA { r: 0, g: 0, b: 0, a: 0 });
+
+    let mut rest = buf;
+    let top_down_height_lim = usize::try_from(height-1)?;
+    let mut row = if order == ScanlineOrder::TopDown { 0 } else { top_down_height_lim };
+    let mut col = 0;
+    let width_conv = usize::try_from(width)?;
+
+    loop {
+        if buf.len() < 2 {
+            bail!("RLE buffer ended without ending bitmap")
+        }
+
+        let next_instr;
+        (next_instr, rest) = rest.split_at(2);
+
+        // encoded mode - repeat a color a certain number of times
+        if next_instr[0] != 0 {
+            for _ in 0..next_instr[0] {
+                image_data[row*width_conv+col] = palette[usize::from(next_instr[1])];
+                (row, col) = advance_row_col(row, col, width.try_into()?, height.try_into()?, order);
+            }
+        }
+
+        else {
+            match next_instr[1] {
+
+                // end of line
+                0 => {
+                }
+
+                // end of bitmap
+                1 => {
+                    println!("RLE bitmap ended normally (signalled end of bitmap");
+                    break;
+                }
+
+                // delta
+                2 => {
+                    let advance_col;
+                    let advance_row;
+                    (advance_col, rest) = rest.split_at(1);
+                    (advance_row, rest) = rest.split_at(1);
+
+                    if order == ScanlineOrder::TopDown { row += usize::from(advance_row[0]); } else { row -= usize::from(advance_row[0]); }
+                    col += usize::from(advance_col[0]);
+                }
+
+                // absolute mode
+                _ => {
+                    for _ in 0..next_instr[1] {
+                        let idx;
+                        (idx, rest) = rest.split_at(1);
+                        image_data[row*width_conv+col] = palette[usize::from(idx[0])];
+                        (row, col) = advance_row_col(row, col, width.try_into()?, height.try_into()?, order);
+                    }
+
+                    // consume single padding byte if size is odd
+                    if next_instr[1] % 2 == 1 {
+                        (_, rest) = rest.split_at(1);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(RGBAImage { width, height, data: image_data.into_boxed_slice() })
+}
+
+
+fn write_image_rle4(buf: &[u8], order: ScanlineOrder, palette: &[RGBA], width: u64, height: u64) -> Result<RGBAImage, Error> {
+    let mut image_data: Vec<RGBA> = Vec::new();
+    let image_data_size: usize = (width*height).try_into()?;
+    image_data.reserve_exact(image_data_size);
+    image_data.resize(image_data_size, RGBA { r: 0, g: 0, b: 0, a: 0 });
+
+    let mut rest = buf;
+    let top_down_height_lim = usize::try_from(height-1)?;
+    let mut row = if order == ScanlineOrder::TopDown { 0 } else { top_down_height_lim };
+    let mut col = 0;
+    let width_conv = usize::try_from(width)?;
+
+    loop {
+        if buf.len() < 2 {
+            bail!("RLE buffer ended without ending bitmap")
+        }
+        
+        let next_instr;
+        (next_instr, rest) = rest.split_at(2);
+
+        // encoded mode - repeat a color a certain number of times
+        if next_instr[0] != 0 {
+            let even_color = usize::from(next_instr[1] >> 4);
+            let odd_color = usize::from(next_instr[1] & 0xF);
+            for i in 0..next_instr[0] {
+                if i % 2 == 0 {
+                    image_data[row*width_conv+col] = palette[even_color];
+                }
+                else {
+                    image_data[row*width_conv+col] = palette[odd_color];
+                }
+
+                (row, col) = advance_row_col(row, col, width.try_into()?, height.try_into()?, order);
+            }
+        }
+
+        else {
+            match next_instr[1] {
+
+                // end of line
+                0 => {
+                }
+
+                // end of bitmap
+                1 => {
+                    println!("RLE bitmap ended normally (signalled end of bitmap)");
+                    break;
+                }
+
+                // delta
+                2 => {
+                    let advance_col;
+                    let advance_row;
+                    (advance_col, rest) = rest.split_at(1);
+                    (advance_row, rest) = rest.split_at(1);
+
+                    if order == ScanlineOrder::TopDown { row += usize::from(advance_row[0]); } else { row -= usize::from(advance_row[0]); }
+                    col += usize::from(advance_col[0]);
+                }
+
+                // absolute mode
+                _ => {
+                    let mut i = 0;
+                    while i < next_instr[1] {
+                        let idx;
+                        (idx, rest) = rest.split_at(1);
+                        let high_color = idx[0] >> 4;
+                        let low_color = idx[0] & 0x0F;
+
+                        image_data[row*width_conv+col] = palette[usize::from(high_color)];
+                        (row, col) = advance_row_col(row, col, width.try_into()?, height.try_into()?, order);
+                        i += 1;
+                        if i >= next_instr[1] {
+                            break;
+                        }
+
+                        image_data[row*width_conv+col] = palette[usize::from(low_color)];
+                        (row, col) = advance_row_col(row, col, width.try_into()?, height.try_into()?, order);
+                        i += 1;
+                    }
+
+                    // consume single padding byte if size is odd
+                    if next_instr[1].div_ceil(2) % 2 == 1 {
+                        (_, rest) = rest.split_at(1);
+                    }
+                }
             }
         }
     }
@@ -797,73 +991,85 @@ pub fn decode(rest: &[u8]) -> Result<RGBAImage, Error> {
     }
 
     // sort into differing scanline decode methods based on bit depth and compression type
-    match bit_depth {
-        BitDepth::One => {
-            if compression != Compression::RGB {
-                bail!("Bit depth of 1 only supports RGB compression (used {compression:#?})")
-            }
+    match compression {
+        Compression::RLE4 => {
             let rgba_palette = create_palette(rest, bit_depth.into(), palette_size.unwrap(), &palette_format)?;
-            let decode_method = Paletted1 { palette: &rgba_palette };
-            write_image(index_bytes, &decode_method, scanline_order, width_converted, height)
+            write_image_rle4(index_bytes, scanline_order, &rgba_palette, width_converted, height)
         }
-        BitDepth::Two => {
-            if compression != Compression::RGB {
-                bail!("Bit depth of 2 only supports RGB compression (used {compression:#?})")
-            }
+        Compression::RLE8 => {
             let rgba_palette = create_palette(rest, bit_depth.into(), palette_size.unwrap(), &palette_format)?;
-            let decode_method = Paletted2 { palette: &rgba_palette };
-            write_image(index_bytes, &decode_method, scanline_order, width_converted, height)
+            write_image_rle8(index_bytes, scanline_order, &rgba_palette, width_converted, height)
         }
-        BitDepth::Four => {
-            if compression != Compression::RGB {
-                bail!("Bit depth of 4 only supports RGB compression (used {compression:#?})")
-            }
-            let rgba_palette = create_palette(rest, bit_depth.into(), palette_size.unwrap(), &palette_format)?;
-            let decode_method = Paletted4 { palette: &rgba_palette };
-            write_image(index_bytes, &decode_method, scanline_order, width_converted, height)
-        }
-        BitDepth::Eight => {
-            if compression != Compression::RGB {
-                bail!("Bit depth of 8 only supports RGB compression (used {compression:#?})")
-            }
-            let rgba_palette = create_palette(rest, bit_depth.into(), palette_size.unwrap(), &palette_format)?;
-            let decode_method = Paletted8 { palette: &rgba_palette };
-            write_image(index_bytes, &decode_method, scanline_order, width_converted, height)
-        }
-        BitDepth::Sixteen => {
-            match compression {
-                Compression::RGB => {
-                    let encoding_method = Uncompressed16 {};
-                    write_image(index_bytes, &encoding_method, scanline_order, width_converted, height)
+        _ => {
+            match bit_depth {
+                BitDepth::One => {
+                    if compression != Compression::RGB {
+                        bail!("Bit depth of 1 only supports RGB compression (used {compression:#?})")
+                    }
+                    let rgba_palette = create_palette(rest, bit_depth.into(), palette_size.unwrap(), &palette_format)?;
+                    let decode_method = Paletted1 { palette: &rgba_palette };
+                    write_image(index_bytes, &decode_method, scanline_order, width_converted, height)
                 }
-                Compression::Bitfields => {
-                    let encoding_method = Bitfield16::new(bitmask_red, bitmask_green, bitmask_blue)?;
-                    write_image(index_bytes, &encoding_method, scanline_order, width_converted, height)
+                BitDepth::Two => {
+                    if compression != Compression::RGB {
+                        bail!("Bit depth of 2 only supports RGB compression (used {compression:#?})")
+                    }
+                    let rgba_palette = create_palette(rest, bit_depth.into(), palette_size.unwrap(), &palette_format)?;
+                    let decode_method = Paletted2 { palette: &rgba_palette };
+                    write_image(index_bytes, &decode_method, scanline_order, width_converted, height)
                 }
-                _ => bail!("Bit depth of 16 only supports RGB compression or bitfield compression (used {compression:#?})")
+                BitDepth::Four => {
+                    if compression != Compression::RGB {
+                        bail!("Bit depth of 4 only supports RGB compression (used {compression:#?})")
+                    }
+                    let rgba_palette = create_palette(rest, bit_depth.into(), palette_size.unwrap(), &palette_format)?;
+                    let decode_method = Paletted4 { palette: &rgba_palette };
+                    write_image(index_bytes, &decode_method, scanline_order, width_converted, height)
+                }
+                BitDepth::Eight => {
+                    if compression != Compression::RGB {
+                        bail!("Bit depth of 8 only supports RGB compression (used {compression:#?})")
+                    }
+                    let rgba_palette = create_palette(rest, bit_depth.into(), palette_size.unwrap(), &palette_format)?;
+                    let decode_method = Paletted8 { palette: &rgba_palette };
+                    write_image(index_bytes, &decode_method, scanline_order, width_converted, height)
+                }
+                BitDepth::Sixteen => {
+                    match compression {
+                        Compression::RGB => {
+                            let encoding_method = Uncompressed16 {};
+                            write_image(index_bytes, &encoding_method, scanline_order, width_converted, height)
+                        }
+                        Compression::Bitfields => {
+                            let encoding_method = Bitfield16::new(bitmask_red, bitmask_green, bitmask_blue)?;
+                            write_image(index_bytes, &encoding_method, scanline_order, width_converted, height)
+                        }
+                        _ => bail!("Bit depth of 16 only supports RGB compression or bitfield compression (used {compression:#?})")
+                    }
+                }
+                BitDepth::TwentyFour => {
+                    if compression != Compression::RGB {
+                        bail!("Bit depth of 24 only supports RGB compression (used {compression:#?})")
+                    }
+                    let decode_method = Uncompressed24 {};
+                    write_image(index_bytes, &decode_method, scanline_order, width_converted, height)
+                }
+                BitDepth::ThirtyTwo => {
+                    match compression {
+                        Compression::RGB => {
+                            let encoding_method = Uncompressed32 {};
+                            write_image(index_bytes, &encoding_method, scanline_order, width_converted, height)
+                        }
+                        Compression::Bitfields => {
+                            let encoding_method = Bitfield32::new(bitmask_red, bitmask_green, bitmask_blue)?;
+                            write_image(index_bytes, &encoding_method, scanline_order, width_converted, height)
+                        }
+                        _ => bail!("Bit depth of 32 only supports RGB compression or bitfield compression (used {compression:#?})")
+                    }
+                }
             }
         }
-        BitDepth::TwentyFour => {
-            if compression != Compression::RGB {
-                bail!("Bit depth of 24 only supports RGB compression (used {compression:#?})")
-            }
-            let decode_method = Uncompressed24 {};
-            write_image(index_bytes, &decode_method, scanline_order, width_converted, height)
-        }
-        BitDepth::ThirtyTwo => {
-            match compression {
-                Compression::RGB => {
-                    let encoding_method = Uncompressed32 {};
-                    write_image(index_bytes, &encoding_method, scanline_order, width_converted, height)
-                }
-                Compression::Bitfields => {
-                    let encoding_method = Bitfield32::new(bitmask_red, bitmask_green, bitmask_blue)?;
-                    write_image(index_bytes, &encoding_method, scanline_order, width_converted, height)
-                }
-                _ => bail!("Bit depth of 32 only supports RGB compression or bitfield compression (used {compression:#?})")
-            }
-        }
-    } 
+    }
 }
 
 
